@@ -215,10 +215,35 @@ finished_calibrating(struct display *d)
  * the drag was before it: the fingers had come to rest. */
 #define SCROLL_FLING_IDLE_MS 100
 
+/*
+ * Two fingers dragging content rightward while the cursor sits in a strip
+ * along the focused window's left edge is taken as a back gesture instead
+ * of a scroll, mirroring the edge-swipe back of a touchscreen. It injects
+ * KEY_BACK rather than a synthetic edge touch: Android 13 only animates
+ * predictive back for the back-to-home case, so a progress-tracked edge
+ * drag would buy nothing that a key press does not, and the key works
+ * regardless of the navigation mode or of whether apps are freeform
+ * windows. Gated by persist.waydroid.touch_back_gesture (default enabled).
+ *
+ * The gesture is classified once, as soon as the drag has a direction, and
+ * a gesture claimed for back never presses a touch - so it cannot scroll,
+ * fling or tap. "Rightward" means the direction that drags content right,
+ * which follows the host's natural-scroll setting exactly as scrolling
+ * already does.
+ *
+ * The strip width and the distance needed to fire are dp defaults that
+ * persist.waydroid.touch_back_edge_zone and .touch_back_distance override,
+ * since how much of the window to give up to the gesture is a matter of
+ * taste (and of how wide the display is).
+ */
+#define BACK_EDGE_ZONE_DP 64
+#define BACK_TRIGGER_DP 40
+
 static int get_touch_id(struct display *display, int id);
 static int create_touch_id(struct display *display, int id);
 static int flush_touch_id(struct display *display, int id);
 static void scroll_gesture_end(struct display *display, bool cancel);
+static void back_gesture_reset(struct display *display);
 
 void
 do_hotplug(struct display *display) {
@@ -272,6 +297,7 @@ do_hotplug(struct display *display) {
             display->pendingScrollStop = false;
             display->pendingScrollDX = 0;
             display->pendingScrollDY = 0;
+            back_gesture_reset(display);
             /* The Android-side touch device went with it, so no fling of
              * ours can still be running for resting fingers to catch. */
             display->lastScrollLiftTime = {};
@@ -1110,6 +1136,59 @@ scroll_gesture_read_props(struct display *display)
     double px_per_dp = (density > 0 ? density : 160 * display->scale) / 160.0;
     display->scrollTouchSlop = SCROLL_TOUCH_SLOP_DP * px_per_dp;
     display->scrollFlingMinSpeed = SCROLL_FLING_MIN_DP_PER_S * px_per_dp / 1000.0;
+
+    display->touchBackGesture =
+        property_get_bool("persist.waydroid.touch_back_gesture", true);
+
+    /* Both in dp, both re-read per gesture so they can be tuned live. */
+    double edge_dp = BACK_EDGE_ZONE_DP;
+    if (property_get("persist.waydroid.touch_back_edge_zone", prop, nullptr) > 0) {
+        double zone = atof(prop);
+        if (zone > 0)
+            edge_dp = zone;
+    }
+    double dist_dp = BACK_TRIGGER_DP;
+    if (property_get("persist.waydroid.touch_back_distance", prop, nullptr) > 0) {
+        double dist = atof(prop);
+        if (dist > 0)
+            dist_dp = dist;
+    }
+    display->backEdgeZone = edge_dp * px_per_dp;
+    /* Measured on the same footing as the slop, i.e. after the speed
+     * multiplier, so both thresholds scale together when it is tuned. */
+    display->backTriggerDist = dist_dp * px_per_dp;
+}
+
+static void
+back_gesture_reset(struct display *display)
+{
+    display->backGestureChecked = false;
+    display->backGestureArmed = false;
+    display->backGestureFired = false;
+    display->backGestureDX = 0;
+}
+
+/* Distance from the cursor to the left edge of the window it is over.
+ * Freeform windows each have their own layer origin, and the user reasons
+ * about the window's edge rather than the Android display's. */
+static double
+back_gesture_edge_distance(struct display *display)
+{
+    if (!display->pointer_surface)
+        return -1;
+
+    auto layer = display->layers.find(display->pointer_surface);
+    double originX = layer != display->layers.end() ? layer->second.x : 0;
+    return display->ptrPrvX - originX;
+}
+
+static void
+back_gesture_emit_key(struct display *display)
+{
+    /* Same path as a real host key press, so the keysDown bookkeeping that
+     * releases stuck keys on focus loss stays correct. */
+    send_key_event(display, KEY_BACK, WL_KEYBOARD_KEY_STATE_PRESSED);
+    send_key_event(display, KEY_BACK, WL_KEYBOARD_KEY_STATE_RELEASED);
 }
 
 static void
@@ -1145,6 +1224,7 @@ scroll_gesture_end(struct display *display, bool cancel)
     display->pendingScrollDeltas = false;
     display->pendingScrollDX = 0;
     display->pendingScrollDY = 0;
+    back_gesture_reset(display);
     if (!display->scrollGestureActive)
         return;
     display->scrollGestureActive = false;
@@ -1239,6 +1319,54 @@ scroll_gesture_flush(struct display *display)
     double dx = display->pendingScrollDX;
     double dy = display->pendingScrollDY;
 
+    /* A hold catch may already have pressed a finger to halt a coasting
+     * fling. While that press has not started dragging, a back gesture can
+     * still claim it - the press has already done its job, so it is
+     * cancelled rather than dragged on. A press that has dragged is a
+     * scroll in progress and is left alone. */
+    bool claimable = !display->scrollGestureActive || !display->scrollGestureMoved;
+
+    /* Classify once, as soon as the drag is long enough to have a direction
+     * (the same point at which a scroll would otherwise press): a mostly
+     * rightward drag starting in the window's left edge strip is a back
+     * gesture. Claiming it here is what keeps it from ever dragging. */
+    if (claimable && !display->backGestureChecked &&
+            std::hypot(dx, dy) > display->scrollTouchSlop) {
+        double edge = back_gesture_edge_distance(display);
+        bool rightward = display->touchBackGesture && dx > 0 &&
+                         dx > 2 * std::abs(dy);
+
+        if (rightward && edge >= 0 && edge <= display->backEdgeZone) {
+            /* scroll_gesture_end clears the back state, so the flags below
+             * have to be set after cancelling the caught press. */
+            if (display->scrollGestureActive)
+                scroll_gesture_end(display, true);
+            display->backGestureArmed = true;
+            ALOGI("touch back: armed %d px from the window's left edge",
+                  (int)edge);
+        } else if (rightward) {
+            ALOGI("touch back: not armed, %d px from the window's left edge "
+                  "(zone is %d px)", (int)edge, (int)display->backEdgeZone);
+        }
+        display->backGestureChecked = true;
+    }
+
+    if (display->backGestureArmed) {
+        display->pendingScrollDX = 0;
+        display->pendingScrollDY = 0;
+        display->pendingScrollDeltas = false;
+        display->backGestureDX += dx;
+        /* One back per gesture; the rest of the drag is swallowed so a long
+         * swipe cannot repeat it, and lifting cannot tap anything. */
+        if (!display->backGestureFired &&
+                display->backGestureDX > display->backTriggerDist) {
+            display->backGestureFired = true;
+            ALOGI("touch back: fired after %d px", (int)display->backGestureDX);
+            back_gesture_emit_key(display);
+        }
+        return;
+    }
+
     if (ensure_pipe(display, INPUT_TOUCH)) {
         display->pendingScrollDX = 0;
         display->pendingScrollDY = 0;
@@ -1282,8 +1410,13 @@ scroll_gesture_flush(struct display *display)
         /* Clutch: the synthetic finger ran off the screen mid-gesture.
          * Cancel it (no fling) and press down again re-anchored; this
          * frame's residual delta is dropped, the gesture continues with
-         * the next one. */
+         * the next one. The re-press has not dragged yet, so preserve the
+         * back classification across it: otherwise this would look like a
+         * fresh gesture and a rightward scroll with the cursor near the
+         * edge could be claimed as back mid-scroll. */
+        bool backChecked = display->backGestureChecked;
         scroll_gesture_end(display, true);
+        display->backGestureChecked = backChecked;
         touch_id = create_touch_id(display, SCROLL_SYNTH_TOUCH_ID);
         if (touch_id == -1)
             return;
@@ -1434,7 +1567,8 @@ pointer_handle_axis(void *data, struct wl_pointer *,
 
     if (display->lastAxisSource == WL_POINTER_AXIS_SOURCE_FINGER &&
             (display->pointer_surface || display->scrollGestureActive)) {
-        if (!display->scrollGestureActive && !display->pendingScrollDeltas) {
+        if (!display->scrollGestureActive && !display->pendingScrollDeltas &&
+                !display->backGestureArmed) {
             /* Re-read at gesture start so it can be toggled on the fly */
             scroll_gesture_read_props(display);
         }
@@ -1513,8 +1647,10 @@ pointer_handle_axis_stop(void *data, struct wl_pointer *, uint32_t, uint32_t)
     struct display* display = (struct display*)data;
 
     /* Fingers lifted off the trackpad: finish the synthetic drag with a
-     * touch up, letting Android compute the fling from the drag velocity. */
-    if (display->scrollGestureActive || display->pendingScrollDeltas)
+     * touch up, letting Android compute the fling from the drag velocity.
+     * A back gesture has no touch to lift but still has state to clear. */
+    if (display->scrollGestureActive || display->pendingScrollDeltas ||
+            display->backGestureArmed)
         display->pendingScrollStop = true;
 }
 
