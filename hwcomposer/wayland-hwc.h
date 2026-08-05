@@ -418,6 +418,9 @@ handle_relative_motion(void *data, struct zwp_relative_pointer_v1*,
 void
 snapshot_inactive_app_window(struct display *display, struct window *window);
 
+bool
+flush_display(struct display *display, int timeout_ms);
+
 struct display *
 create_display(const char* gralloc);
 void

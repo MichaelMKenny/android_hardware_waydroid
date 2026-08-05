@@ -45,6 +45,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <errno.h>
+#include <poll.h>
 #include <linux/input.h>
 #include <linux/memfd.h>
 #include <drm_fourcc.h>
@@ -2524,6 +2525,61 @@ void open_windows::erase(const key_type& key) {
         std::string windows_size_str = std::to_string(windows.size());
         property_set("waydroid.open_windows", windows_size_str.c_str());
     }
+}
+
+/* Flush queued requests, waiting up to timeout_ms for the socket to drain if
+ * the compositor has stopped reading it.
+ *
+ * wl_display_flush() reports EAGAIN when the send buffer is full. That is a
+ * recoverable condition, and libwayland expects the caller to wait for POLLOUT
+ * and retry; every call site here used to discard the result instead, so
+ * nothing ever waited and queued requests simply piled up. Once libwayland's
+ * own buffer fills it flushes implicitly from inside wl_proxy_marshal(), and
+ * that path has nowhere to report EAGAIN to - it calls display_fatal_error(),
+ * which poisons the connection permanently. Every later request is then
+ * silently dropped (the display freezes) and the Wayland thread aborts, taking
+ * the session down. Draining here is what keeps that implicit flush from ever
+ * having to fail.
+ *
+ * Returns false if the connection is already unusable, or if it was still
+ * backed up when the timeout expired. A timeout_ms of 0 polls without waiting.
+ */
+bool
+flush_display(struct display *display, int timeout_ms)
+{
+    struct wl_display *wl = display->display;
+    struct pollfd pfd = {};
+    struct timespec start;
+
+    pfd.fd = wl_display_get_fd(wl);
+    pfd.events = POLLOUT;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    while (wl_display_flush(wl) == -1) {
+        /* A transient EAGAIN never sets the display's error; if one is set the
+         * connection is already dead and flush is just reporting it back. */
+        if (errno != EAGAIN || wl_display_get_error(wl) != 0)
+            return false;
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int elapsed = (now.tv_sec - start.tv_sec) * 1000 +
+                      (now.tv_nsec - start.tv_nsec) / 1000000;
+        int remaining = timeout_ms - elapsed;
+        if (remaining <= 0)
+            return false;
+
+        int ret = poll(&pfd, 1, remaining);
+        if (ret == 0)
+            return false;
+        if (ret == -1) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+    }
+
+    return true;
 }
 
 static void* hwc_wayland_thread(void* data) {

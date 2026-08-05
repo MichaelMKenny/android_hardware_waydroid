@@ -433,6 +433,42 @@ static void reset_per_commit_state_window(waydroid_hwc_composer_device_1 *pdev) 
     }
 }
 
+/* Long enough to ride out a momentary hiccup in the compositor, short enough
+ * that a real stall costs frames instead of wedging SurfaceFlinger's binder
+ * thread. hwc_set already blocks up to 100 ms per layer in sync_wait(), so a
+ * bounded wait here is not a new cost to this path. */
+static constexpr int kFlushDrainTimeoutMs = 16;
+
+/* Retire a frame without rendering it, for when the compositor has stopped
+ * draining the socket. Adding this frame's requests to a backlog that is
+ * already at the socket's limit is precisely what drives libwayland's implicit
+ * flush into its fatal path, so drop the frame instead. Nothing is lost
+ * visually - a compositor that is not reading is not drawing either - and the
+ * session resumes by itself once the socket drains.
+ *
+ * Release the buffers we were handed and retire the frame as usual, so
+ * SurfaceFlinger sees an ordinary, if late, frame rather than an error. */
+static int hwc_drop_frame(waydroid_hwc_composer_device_1 *pdev,
+                          hwc_display_contents_1_t *contents) {
+    for (size_t l = 0; l < contents->numHwLayers; l++) {
+        auto *layer = &contents->hwLayers[l];
+        if (layer->acquireFenceFd != -1) {
+            close(layer->acquireFenceFd);
+            layer->acquireFenceFd = -1;
+        }
+        layer->releaseFenceFd = -1;
+    }
+    if (contents->outbufAcquireFenceFd != -1) {
+        close(contents->outbufAcquireFenceFd);
+        contents->outbufAcquireFenceFd = -1;
+    }
+
+    sw_sync_timeline_inc(pdev->timeline_fd, 1);
+    contents->retireFenceFd = sw_sync_fence_create(pdev->timeline_fd,
+            "hwc_contents_release", ++pdev->next_sync_point);
+    return 0;
+}
+
 static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
                    hwc_display_contents_1_t** displays) {
     if (HWC_DISPLAY_PRIMARY >= numDisplays || !displays)
@@ -442,6 +478,21 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
 
     hwc_display_contents_1_t* contents = displays[HWC_DISPLAY_PRIMARY];
     assert(contents);
+
+    /* Drain anything still queued before adding another frame to it. Done
+     * before windowsMutex is taken, since the Wayland thread needs that lock
+     * to service events - and blocking here rather than later also stops
+     * SurfaceFlinger handing us the next frame while we wait. */
+    if (!flush_display(pdev->display, kFlushDrainTimeoutMs)) {
+        /* Rate-limited: a stalled compositor trips this every frame */
+        static unsigned stalls = 0;
+        if (stalls++ % 1024 == 0) {
+            ALOGW("hwc_set: Wayland socket still full after %d ms (%u dropped "
+                  "frames); compositor is not reading", kFlushDrainTimeoutMs,
+                  stalls);
+        }
+        return hwc_drop_frame(pdev, contents);
+    }
 
     if (pdev->should_compose && contents->flags & HWC_GEOMETRY_CHANGED) {
         pdev->display->buffer_map.clear();
