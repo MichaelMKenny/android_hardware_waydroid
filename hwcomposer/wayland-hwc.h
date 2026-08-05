@@ -346,6 +346,13 @@ struct display {
     double touchScrollScale;
     double scrollTouchSlop;
     double scrollFlingMinSpeed;
+    bool touchBackGesture;
+    double backEdgeZone;
+    double backTriggerDist;
+    bool backGestureChecked;
+    bool backGestureArmed;
+    bool backGestureFired;
+    double backGestureDX;
     bool scrollGestureActive;
     bool scrollGestureMoved;
     double scrollFingerX;
