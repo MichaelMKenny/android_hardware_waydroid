@@ -431,6 +431,12 @@ static void reset_per_commit_state_window(waydroid_hwc_composer_device_1 *pdev) 
     }
 }
 
+/* Long enough to ride out a momentary hiccup in the compositor, short enough
+ * that a real stall costs frames instead of wedging SurfaceFlinger's binder
+ * thread. hwc_set already blocks up to 100 ms per layer in sync_wait(), so a
+ * bounded wait here is not a new cost to this path. */
+static constexpr int kFlushDrainTimeoutMs = 16;
+
 static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
                    hwc_display_contents_1_t** displays) {
     if (HWC_DISPLAY_PRIMARY >= numDisplays || !displays)
@@ -440,6 +446,19 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
 
     hwc_display_contents_1_t* contents = displays[HWC_DISPLAY_PRIMARY];
     assert(contents);
+
+    /* Drain anything still queued before adding another frame to it. Done
+     * before windowsMutex is taken, since the Wayland thread needs that lock
+     * to service events - and blocking here rather than later also stops
+     * SurfaceFlinger handing us the next frame while we wait. */
+    if (!flush_display(pdev->display, kFlushDrainTimeoutMs)) {
+        /* Rate-limited: a stalled compositor trips this every frame */
+        static unsigned stalls = 0;
+        if (stalls++ % 1024 == 0) {
+            ALOGW("hwc_set: Wayland socket still full after %d ms (%u times); "
+                  "compositor is not reading", kFlushDrainTimeoutMs, stalls);
+        }
+    }
 
     if (pdev->should_compose && contents->flags & HWC_GEOMETRY_CHANGED) {
         pdev->display->buffer_map.clear();
